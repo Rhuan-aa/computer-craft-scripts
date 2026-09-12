@@ -1,54 +1,62 @@
--- stock.lua -- Mantenedor de estoque AE2 via ME Bridge (Advanced Peripherals)
--- ATM10 7.3 / CC:Tweaked 1.113.1 / AP 0.7.62b / AE2 19.2.17
+-- stock.lua -- Mantenedor de estoque AE2 via ME Bridge
+-- ATM10 7.3 / CC:Tweaked 1.113.1 / Advanced Peripherals 0.7.62b / AE2 19.2.17
+-- Calibrado para a API real: tipo "me_bridge", metodos isCrafting / isCraftable
 
 local CONFIG = {
-  interval  = 15,          -- segundos entre verificacoes
-  cpuName   = "StockCPU",  -- nome da CPU dedicada (bigorna)
-  cooldown  = 180,         -- seg. antes de repedir o mesmo item
-  reserveCPU = 1,          -- CPUs deixadas livres para crafts manuais
+  interval   = 15,          -- segundos entre verificacoes
+  cpuName    = "StockCPU",  -- nome da CPU dedicada (renomeie na bigorna)
+  cooldown   = 180,         -- seg. antes de repedir o mesmo item
+  reserveCPU = 1,           -- CPUs deixadas livres para crafts manuais
+  fallbackCPUs = 2,         -- usado so se getCraftingCPUs nao existir
 
   items = {
     -- { name = "modid:item", min = <gatilho>, batch = <quanto pedir> }
-    { name = "mekanism:steel_ingot",         min = 512,  batch = 256 },
-    { name = "mekanism:alloy_infused",       min = 256,  batch = 128 },
-    { name = "mekanism:alloy_reinforced",    min = 128,  batch = 64  },
-    { name = "ae2:calculation_processor",    min = 128,  batch = 64  },
-    { name = "ae2:logic_processor",          min = 128,  batch = 64  },
-    { name = "ae2:engineering_processor",    min = 128,  batch = 64  },
-    { name = "minecraft:iron_ingot",         min = 1024, batch = 512 },
+    -- Comece com 2 ou 3 itens que voce tem CERTEZA que tem pattern.
+    { name = "ae2:fluix_smart_cable", min = 10, batch = 40 },
+    { name = "ae2:logic_processor", min = 8, batch = 16 },
+    { name = "ae2:calculation_processor", min = 8, batch = 16 },
+    { name = "ae2:engineering_processor", min = 8, batch = 16 },
+    { name = "extendedae:concurrent_processor", min = 8, batch = 16 },
   },
 }
 
-local bridge = peripheral.find("meBridge")
+-- ---------------------------------------------------------------- setup
+
+local bridge = peripheral.find("me_bridge") or peripheral.find("meBridge")
 if not bridge then
-  error("ME Bridge nao encontrado. Verifique o modem e o cabo de rede.")
+  error("ME Bridge nao encontrado. Confira o lado/modem com peripheral.getNames()")
 end
+
+local hasCPUs      = bridge.getCraftingCPUs ~= nil
+local hasCraftable = bridge.isCraftable ~= nil
 
 local pending = {}  -- name -> timestamp de expiracao do pedido
 
-local function now()
-  return os.epoch("utc") / 1000
-end
+local function now() return os.epoch("utc") / 1000 end
 
--- Toda chamada ao bridge vai encapsulada: AP lanca erro (nao retorna nil)
--- quando o item e desconhecido ou a rede esta offline.
+-- O AP lanca erro (nao retorna nil) para item desconhecido ou rede offline.
 local function safe(fn, ...)
+  if not fn then return nil end
   local ok, res = pcall(fn, ...)
   if ok then return res end
-  return nil, res
+  return nil
 end
 
+-- ---------------------------------------------------------------- bridge
+
 local function stockOf(name)
+  -- getItem retorna nil quando a quantidade e zero, nao amount = 0
   local item = safe(bridge.getItem, { name = name })
   if item and item.amount then return item.amount end
   return 0
 end
 
-local function isCrafting(name)
-  return safe(bridge.isItemCrafting, { name = name }) == true
+local function isCraftingNow(name)
+  return safe(bridge.isCrafting, { name = name }) == true
 end
 
 local function countFreeCPUs()
+  if not hasCPUs then return CONFIG.fallbackCPUs end
   local cpus = safe(bridge.getCraftingCPUs) or {}
   local free = 0
   for _, c in ipairs(cpus) do
@@ -57,38 +65,47 @@ local function countFreeCPUs()
   return free
 end
 
--- A assinatura de craftItem mudou entre builds do AP; tenta as 3 formas.
+-- A assinatura de craftItem varia entre builds do AP; tenta as 3 formas.
 local function requestCraft(name, count)
-  local item = { name = name, count = count }
-  local r = safe(bridge.craftItem, item, CONFIG.cpuName)
+  local r = safe(bridge.craftItem, { name = name, count = count }, CONFIG.cpuName)
   if r == nil then
-    item.cpu = CONFIG.cpuName
-    r = safe(bridge.craftItem, item)
+    r = safe(bridge.craftItem, { name = name, count = count, cpu = CONFIG.cpuName })
   end
   if r == nil then
     r = safe(bridge.craftItem, { name = name, count = count })
   end
-  return r == true or (type(r) == "table" and r.status ~= nil)
+  return r == true or type(r) == "table"
 end
 
--- Valida a lista na inicializacao contra os padroes realmente existentes.
+-- ---------------------------------------------------------------- boot
+
 local function validate()
-  local list = safe(bridge.listCraftableItems)
-  if not list then
-    print("[aviso] listCraftableItems indisponivel; pulando validacao.")
+  if not hasCraftable then
+    print("[aviso] isCraftable indisponivel; pulando validacao de padroes.")
     return
   end
-  local set = {}
-  for _, i in ipairs(list) do set[i.name] = true end
   for _, e in ipairs(CONFIG.items) do
-    if not set[e.name] then
-      print("[ERRO] sem padrao de craft para: " .. e.name)
+    if safe(bridge.isCraftable, { name = e.name }) ~= true then
+      print("[ERRO] sem padrao de craft: " .. e.name)
     end
   end
 end
 
-print("Stock keeper iniciado -- " .. #CONFIG.items .. " itens monitorados")
+term.clear()
+term.setCursorPos(1, 1)
+print("Stock keeper -- " .. #CONFIG.items .. " itens monitorados")
+
+if bridge.isOnline and bridge.isOnline() ~= true then
+  print("[aviso] bridge offline/sem channel -- verifique a rede AE2")
+end
+if not hasCPUs then
+  print("[aviso] getCraftingCPUs ausente; assumindo "
+        .. CONFIG.fallbackCPUs .. " CPUs livres")
+end
+
 validate()
+
+-- ---------------------------------------------------------------- loop
 
 while true do
   local free = countFreeCPUs() - CONFIG.reserveCPU
@@ -99,19 +116,21 @@ while true do
 
     if have >= e.min then
       pending[e.name] = nil
+
     elseif free > 0
        and (not pending[e.name] or t > pending[e.name])
-       and not isCrafting(e.name) then
+       and not isCraftingNow(e.name) then
 
       local count = math.min(e.batch, e.min - have)
+      pending[e.name] = t + CONFIG.cooldown
+
       if requestCraft(e.name, count) then
-        pending[e.name] = t + CONFIG.cooldown
         free = free - 1
-        print(string.format("[%s] craft: %d x %s (estoque %d/%d)",
+        print(string.format("[%s] craft: %d x %s (%d/%d)",
           os.date("%H:%M:%S"), count, e.name, have, e.min))
       else
-        print("[falha] nao consegui agendar: " .. e.name)
-        pending[e.name] = t + CONFIG.cooldown
+        print(string.format("[%s] FALHA ao agendar: %s",
+          os.date("%H:%M:%S"), e.name))
       end
     end
   end
