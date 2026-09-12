@@ -1,6 +1,8 @@
 -- stock.lua -- Mantenedor de estoque AE2 via ME Bridge
 -- ATM10 7.3 / CC:Tweaked 1.113.1 / Advanced Peripherals 0.7.62b / AE2 19.2.17
 
+local VERSION = "v4 -- dump sem serialise"
+
 local CONFIG = {
   interval   = 15,
   cpuName    = "StockCPU",  -- nil = deixa o AE2 escolher a CPU
@@ -120,7 +122,8 @@ end
 -- ---------------------------------------------------------------- boot
 
 term.clear(); term.setCursorPos(1, 1)
-print("Stock keeper -- " .. #CONFIG.items .. " itens")
+print("Stock keeper " .. VERSION)
+print(#CONFIG.items .. " itens monitorados")
 
 if bridge.isOnline and bridge.isOnline() ~= true then
   print("[aviso] bridge offline / sem channel")
