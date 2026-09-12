@@ -1,22 +1,20 @@
 -- stock.lua -- Mantenedor de estoque AE2 via ME Bridge
 -- ATM10 7.3 / CC:Tweaked 1.113.1 / Advanced Peripherals 0.7.62b / AE2 19.2.17
--- Calibrado para a API real: tipo "me_bridge", metodos isCrafting / isCraftable
 
 local CONFIG = {
-  interval   = 15,          -- segundos entre verificacoes
-  cpuName    = "StockCPU",  -- nome da CPU dedicada (renomeie na bigorna)
-  cooldown   = 180,         -- seg. antes de repedir o mesmo item
-  reserveCPU = 1,           -- CPUs deixadas livres para crafts manuais
-  fallbackCPUs = 2,         -- usado so se getCraftingCPUs nao existir
+  interval   = 15,
+  cpuName    = "StockCPU",  -- nil = deixa o AE2 escolher a CPU
+  cooldown   = 180,
+  reserveCPU = 1,
+  fallbackCPUs = 2,
+  debug      = true,        -- mostra o retorno cru do craftItem
 
   items = {
-    -- { name = "modid:item", min = <gatilho>, batch = <quanto pedir> }
-    -- Comece com 2 ou 3 itens que voce tem CERTEZA que tem pattern.
-    { name = "ae2:fluix_smart_cable", min = 10, batch = 40 },
-    { name = "ae2:logic_processor", min = 8, batch = 16 },
-    { name = "ae2:calculation_processor", min = 8, batch = 16 },
-    { name = "ae2:engineering_processor", min = 8, batch = 16 },
-    { name = "extendedae:concurrent_processor", min = 8, batch = 16 },
+    { name = "ae2:fluix_smart_cable",            min = 10, batch = 10 },
+    { name = "ae2:logic_processor",              min = 8,  batch = 8  },
+    { name = "ae2:calculation_processor",        min = 8,  batch = 8  },
+    { name = "ae2:engineering_processor",        min = 8,  batch = 8  },
+    { name = "extendedae:concurrent_processor",  min = 8,  batch = 8  },
   },
 }
 
@@ -24,40 +22,61 @@ local CONFIG = {
 
 local bridge = peripheral.find("me_bridge") or peripheral.find("meBridge")
 if not bridge then
-  error("ME Bridge nao encontrado. Confira o lado/modem com peripheral.getNames()")
+  error("ME Bridge nao encontrado.")
 end
 
 local hasCPUs      = bridge.getCraftingCPUs ~= nil
 local hasCraftable = bridge.isCraftable ~= nil
+local cpuName      = CONFIG.cpuName
 
-local pending = {}  -- name -> timestamp de expiracao do pedido
+local pending = {}
 
 local function now() return os.epoch("utc") / 1000 end
 
--- O AP lanca erro (nao retorna nil) para item desconhecido ou rede offline.
+-- Preserva TODOS os retornos: o AP devolve false, "motivo" em caso de recusa.
 local function safe(fn, ...)
-  if not fn then return nil end
-  local ok, res = pcall(fn, ...)
-  if ok then return res end
-  return nil
+  if not fn then return { n = 0 } end
+  local r = table.pack(pcall(fn, ...))
+  if not r[1] then return { n = 1, nil, err = r[2] } end
+  return table.pack(table.unpack(r, 2, r.n))
+end
+
+local function first(fn, ...)
+  return safe(fn, ...)[1]
+end
+
+local function describe(r)
+  if r.err then return "erro: " .. tostring(r.err) end
+  local parts = {}
+  for i = 1, math.max(r.n, 1) do
+    local v = r[i]
+    parts[#parts + 1] = (type(v) == "table")
+      and textutils.serialise(v):gsub("%s+", " ")
+      or tostring(v)
+  end
+  return table.concat(parts, " | ")
 end
 
 -- ---------------------------------------------------------------- bridge
 
 local function stockOf(name)
-  -- getItem retorna nil quando a quantidade e zero, nao amount = 0
-  local item = safe(bridge.getItem, { name = name })
+  local item = first(bridge.getItem, { name = name })
   if item and item.amount then return item.amount end
   return 0
 end
 
 local function isCraftingNow(name)
-  return safe(bridge.isCrafting, { name = name }) == true
+  return first(bridge.isCrafting, { name = name }) == true
+end
+
+local function listCPUs()
+  if not hasCPUs then return nil end
+  return first(bridge.getCraftingCPUs)
 end
 
 local function countFreeCPUs()
-  if not hasCPUs then return CONFIG.fallbackCPUs end
-  local cpus = safe(bridge.getCraftingCPUs) or {}
+  local cpus = listCPUs()
+  if not cpus then return CONFIG.fallbackCPUs end
   local free = 0
   for _, c in ipairs(cpus) do
     if not c.isBusy then free = free + 1 end
@@ -65,45 +84,52 @@ local function countFreeCPUs()
   return free
 end
 
--- A assinatura de craftItem varia entre builds do AP; tenta as 3 formas.
+-- Retorna: ok (boolean), detalhe (string)
 local function requestCraft(name, count)
-  local r = safe(bridge.craftItem, { name = name, count = count }, CONFIG.cpuName)
-  if r == nil then
-    r = safe(bridge.craftItem, { name = name, count = count, cpu = CONFIG.cpuName })
+  local r
+  if cpuName then
+    r = safe(bridge.craftItem, { name = name, count = count }, cpuName)
+    if r[1] ~= true then
+      r = safe(bridge.craftItem, { name = name, count = count, cpu = cpuName })
+    end
   end
-  if r == nil then
+  if not r or r[1] ~= true then
     r = safe(bridge.craftItem, { name = name, count = count })
   end
-  return r == true or type(r) == "table"
+  return r[1] == true, describe(r)
 end
 
 -- ---------------------------------------------------------------- boot
 
-local function validate()
-  if not hasCraftable then
-    print("[aviso] isCraftable indisponivel; pulando validacao de padroes.")
-    return
-  end
-  for _, e in ipairs(CONFIG.items) do
-    if safe(bridge.isCraftable, { name = e.name }) ~= true then
-      print("[ERRO] sem padrao de craft: " .. e.name)
+term.clear(); term.setCursorPos(1, 1)
+print("Stock keeper -- " .. #CONFIG.items .. " itens")
+
+if bridge.isOnline and bridge.isOnline() ~= true then
+  print("[aviso] bridge offline / sem channel")
+end
+
+-- A CPU nomeada existe mesmo? Se nao, para de pedir por nome.
+if cpuName then
+  local cpus, found = listCPUs(), false
+  if cpus then
+    for _, c in ipairs(cpus) do
+      if c.name == cpuName then found = true end
+    end
+    print("CPUs na rede: " .. #cpus)
+    if not found then
+      print("[aviso] CPU '" .. cpuName .. "' nao existe; usando qualquer uma")
+      cpuName = nil
     end
   end
 end
 
-term.clear()
-term.setCursorPos(1, 1)
-print("Stock keeper -- " .. #CONFIG.items .. " itens monitorados")
-
-if bridge.isOnline and bridge.isOnline() ~= true then
-  print("[aviso] bridge offline/sem channel -- verifique a rede AE2")
+if hasCraftable then
+  for _, e in ipairs(CONFIG.items) do
+    if first(bridge.isCraftable, { name = e.name }) ~= true then
+      print("[ERRO] sem padrao: " .. e.name)
+    end
+  end
 end
-if not hasCPUs then
-  print("[aviso] getCraftingCPUs ausente; assumindo "
-        .. CONFIG.fallbackCPUs .. " CPUs livres")
-end
-
-validate()
 
 -- ---------------------------------------------------------------- loop
 
@@ -123,14 +149,19 @@ while true do
 
       local count = math.min(e.batch, e.min - have)
       pending[e.name] = t + CONFIG.cooldown
+      local ok, detail = requestCraft(e.name, count)
 
-      if requestCraft(e.name, count) then
+      if ok then
         free = free - 1
-        print(string.format("[%s] craft: %d x %s (%d/%d)",
+        print(string.format("[%s] OK %d x %s (%d/%d)",
           os.date("%H:%M:%S"), count, e.name, have, e.min))
       else
-        print(string.format("[%s] FALHA ao agendar: %s",
-          os.date("%H:%M:%S"), e.name))
+        print(string.format("[%s] FALHA %s -> %s",
+          os.date("%H:%M:%S"), e.name, detail))
+      end
+
+      if CONFIG.debug then
+        print("  retorno: " .. detail)
       end
     end
   end
