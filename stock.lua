@@ -1,7 +1,7 @@
 -- stock.lua -- Mantenedor de estoque AE2 via ME Bridge
 -- ATM10 7.3 / CC:Tweaked 1.113.1 / Advanced Peripherals 0.7.62b / AE2 19.2.17
 
-local VERSION = "v6 -- trava anti-loop + CPU_BUSY"
+local VERSION = "v7 -- campo count + getItems"
 
 local CONFIG = {
   interval   = 10,
@@ -55,9 +55,14 @@ local function shortName(id) return (tostring(id):gsub("^.-:", "")) end
 
 -- ---------------------------------------------------------------- bridge
 
+-- A build 0.7.62b usa o campo "count"; versoes antigas usavam "amount".
+local function amountOf(item)
+  if type(item) ~= "table" then return 0 end
+  return item.count or item.amount or 0
+end
+
 local function stockOf(name)
-  local item = safe(bridge.getItem, { name = name })
-  return (item and item.amount) or 0
+  return amountOf(safe(bridge.getItem, { name = name }))
 end
 
 local function countFreeCPUs()
@@ -91,7 +96,7 @@ local function missingReport(job)
     local m = miss[i]
     parts[#parts + 1] = string.format("%s x%s",
       shortName(m.name or m.displayName or "?"),
-      tostring(m.amount or m.count or "?"))
+      tostring(m.count or m.amount or "?"))
   end
   if #miss > 4 then parts[#parts + 1] = "(+" .. (#miss - 4) .. ")" end
   return table.concat(parts, ", ")
