@@ -1,14 +1,17 @@
 -- stock.lua -- Mantenedor de estoque AE2 via ME Bridge
 -- ATM10 7.3 / CC:Tweaked 1.113.1 / Advanced Peripherals 0.7.62b / AE2 19.2.17
 
-local VERSION = "v5 -- acompanha job object"
+local VERSION = "v6 -- trava anti-loop + CPU_BUSY"
 
 local CONFIG = {
   interval   = 10,
   cpuName    = "StockCPU",  -- nil = deixa o AE2 escolher
-  cooldown   = 300,         -- espera apos um job falhar
+  retryBusy  = 20,          -- espera curta quando a CPU esta ocupada
+  retryFail  = 300,         -- espera longa quando falta ingrediente
   reserveCPU = 1,
   fallbackCPUs = 2,
+  maxStrikes = 2,           -- crafts que concluem sem aumentar o estoque
+  dryRun     = false,       -- true = so registra, nao pede craft
 
   items = {
     { name = "ae2:fluix_smart_cable",           min = 10, batch = 10 },
@@ -24,12 +27,17 @@ local CONFIG = {
 local bridge = peripheral.find("me_bridge") or peripheral.find("meBridge")
 if not bridge then error("ME Bridge nao encontrado.") end
 
-local hasCPUs   = bridge.getCraftingCPUs ~= nil
-local cpuName   = CONFIG.cpuName
-local jobs      = {}   -- name -> objeto de job em andamento
-local cooldowns = {}   -- name -> timestamp de liberacao
+local hasCPUs = bridge.getCraftingCPUs ~= nil
+local cpuName = CONFIG.cpuName
+
+local jobs      = {}  -- name -> job em andamento
+local baseline  = {}  -- name -> estoque no momento do pedido
+local cooldowns = {}  -- name -> timestamp de liberacao
+local strikes   = {}  -- name -> crafts concluidos sem efeito
+local disabled  = {}  -- name -> true (desistiu deste item)
 
 local function now() return os.epoch("utc") / 1000 end
+local function stamp() return os.date("%H:%M:%S") end
 
 local function safe(fn, ...)
   if type(fn) ~= "function" then return nil end
@@ -38,15 +46,12 @@ local function safe(fn, ...)
   return nil
 end
 
--- Chama um metodo do objeto de job com seguranca
 local function jcall(job, method, ...)
   if not job then return nil end
   return safe(job[method], ...)
 end
 
-local function shortName(id)
-  return (tostring(id):gsub("^.-:", ""))
-end
+local function shortName(id) return (tostring(id):gsub("^.-:", "")) end
 
 -- ---------------------------------------------------------------- bridge
 
@@ -74,13 +79,10 @@ local function requestCraft(name, count)
       r = safe(bridge.craftItem, { name = name, count = count, cpu = cpuName })
     end
   end
-  if type(r) ~= "table" then
-    r = safe(bridge.craftItem, item)
-  end
+  if type(r) ~= "table" then r = safe(bridge.craftItem, item) end
   return (type(r) == "table") and r or nil
 end
 
--- Lista o que esta faltando para o job sair do papel
 local function missingReport(job)
   local miss = jcall(job, "getMissingItems")
   if type(miss) ~= "table" or #miss == 0 then return nil end
@@ -88,7 +90,8 @@ local function missingReport(job)
   for i = 1, math.min(#miss, 4) do
     local m = miss[i]
     parts[#parts + 1] = string.format("%s x%s",
-      shortName(m.name or m.displayName or "?"), tostring(m.amount or m.count or "?"))
+      shortName(m.name or m.displayName or "?"),
+      tostring(m.amount or m.count or "?"))
   end
   if #miss > 4 then parts[#parts + 1] = "(+" .. (#miss - 4) .. ")" end
   return table.concat(parts, ", ")
@@ -98,7 +101,7 @@ end
 
 term.clear(); term.setCursorPos(1, 1)
 print("Stock keeper " .. VERSION)
-print(#CONFIG.items .. " itens monitorados")
+print(#CONFIG.items .. " itens" .. (CONFIG.dryRun and "  [DRY RUN]" or ""))
 
 if bridge.isOnline and bridge.isOnline() ~= true then
   print("[aviso] bridge offline / sem channel")
@@ -116,46 +119,65 @@ if cpuName and hasCPUs then
   end
 end
 
-if bridge.isCraftable then
-  for _, e in ipairs(CONFIG.items) do
-    if safe(bridge.isCraftable, { name = e.name }) ~= true then
-      print("[ERRO] sem padrao: " .. e.name)
-    end
-  end
+-- Checagem de sanidade: ID que le zero e suspeito de estar errado
+for _, e in ipairs(CONFIG.items) do
+  local have = stockOf(e.name)
+  local craftable = safe(bridge.isCraftable, { name = e.name })
+  print(string.format("  %-28s estoque=%-6d padrao=%s",
+    shortName(e.name), have, tostring(craftable)))
 end
 
 print("---")
 
 -- ---------------------------------------------------------------- job
 
--- Retorna true se o job ainda ocupa a vaga (em andamento)
+-- true = job ainda ocupando vaga
 local function trackJob(name, job)
-  local stamp = os.date("%H:%M:%S")
-
   if jcall(job, "isDone") == true then
-    print(string.format("[%s] pronto: %s", stamp, shortName(name)))
     jobs[name] = nil
+    local have = stockOf(name)
+    if have > (baseline[name] or 0) then
+      strikes[name] = 0
+      print(string.format("[%s] pronto: %s (%d)", stamp(), shortName(name), have))
+    else
+      -- Craft concluiu mas o estoque nao subiu: o ID nao casa com a rede.
+      strikes[name] = (strikes[name] or 0) + 1
+      print(string.format("[%s] SUSPEITO %s: craft concluiu, estoque segue %d",
+        stamp(), shortName(name), have))
+      if strikes[name] >= CONFIG.maxStrikes then
+        disabled[name] = true
+        print("  >> DESATIVADO. O ID provavelmente esta errado.")
+        print("  >> rode: find " .. shortName(name))
+      end
+    end
     return false
   end
 
   if jcall(job, "isCanceled") == true then
-    print(string.format("[%s] cancelado: %s", stamp, shortName(name)))
     jobs[name] = nil
-    cooldowns[name] = now() + CONFIG.cooldown
+    cooldowns[name] = now() + CONFIG.retryBusy
+    print(string.format("[%s] cancelado: %s", stamp(), shortName(name)))
     return false
   end
 
   if jcall(job, "isCalculationNotSuccessful") == true
      or jcall(job, "hasErrorOccurred") == true then
-    local why = missingReport(job) or jcall(job, "getDebugMessage") or "motivo desconhecido"
-    print(string.format("[%s] FALHOU %s", stamp, shortName(name)))
-    print("  faltando: " .. tostring(why))
     jobs[name] = nil
-    cooldowns[name] = now() + CONFIG.cooldown
+    local msg  = tostring(jcall(job, "getDebugMessage") or "")
+    local miss = missingReport(job)
+
+    if msg:find("CPU_BUSY") or msg:find("BUSY") then
+      cooldowns[name] = now() + CONFIG.retryBusy
+      -- silencioso: CPU ocupada e situacao normal, nao falha
+    else
+      cooldowns[name] = now() + CONFIG.retryFail
+      print(string.format("[%s] FALHOU %s -> %s",
+        stamp(), shortName(name), miss or msg or "motivo desconhecido"))
+    end
     return false
   end
 
-  return true  -- calculando ou craftando
+  return true
 end
 
 -- ---------------------------------------------------------------- loop
@@ -165,29 +187,37 @@ while true do
   local t = now()
 
   for _, e in ipairs(CONFIG.items) do
-    local busy = false
+    if not disabled[e.name] then
+      local busy = false
 
-    if jobs[e.name] then
-      busy = trackJob(e.name, jobs[e.name])
-      if busy then free = free - 1 end
-    end
+      if jobs[e.name] then
+        busy = trackJob(e.name, jobs[e.name])
+        if busy then free = free - 1 end
+      end
 
-    if not busy then
-      local have = stockOf(e.name)
-      if have >= e.min then
-        cooldowns[e.name] = nil
-      elseif free > 0 and (not cooldowns[e.name] or t > cooldowns[e.name]) then
-        local count = math.min(e.batch, e.min - have)
-        local job = requestCraft(e.name, count)
-        if job then
-          jobs[e.name] = job
-          free = free - 1
-          print(string.format("[%s] pedido: %d x %s (%d/%d)",
-            os.date("%H:%M:%S"), count, shortName(e.name), have, e.min))
-        else
-          print(string.format("[%s] recusado: %s",
-            os.date("%H:%M:%S"), shortName(e.name)))
-          cooldowns[e.name] = t + CONFIG.cooldown
+      if not busy then
+        local have = stockOf(e.name)
+        if have >= e.min then
+          cooldowns[e.name] = nil
+        elseif free > 0 and (not cooldowns[e.name] or t > cooldowns[e.name]) then
+          local count = math.min(e.batch, e.min - have)
+          if CONFIG.dryRun then
+            print(string.format("[%s] (dry) pediria %d x %s (%d/%d)",
+              stamp(), count, shortName(e.name), have, e.min))
+            cooldowns[e.name] = t + CONFIG.retryFail
+          else
+            baseline[e.name] = have
+            local job = requestCraft(e.name, count)
+            if job then
+              jobs[e.name] = job
+              free = free - 1
+              print(string.format("[%s] pedido: %d x %s (%d/%d)",
+                stamp(), count, shortName(e.name), have, e.min))
+            else
+              cooldowns[e.name] = t + CONFIG.retryFail
+              print(string.format("[%s] recusado: %s", stamp(), shortName(e.name)))
+            end
+          end
         end
       end
     end
