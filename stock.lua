@@ -45,14 +45,25 @@ local function first(fn, ...)
   return safe(fn, ...)[1]
 end
 
+-- serialise nao aceita funcoes; este dump aceita e marca como <fn>
+local function dump(v, depth)
+  depth = depth or 0
+  local t = type(v)
+  if t == "function" then return "<fn>" end
+  if t ~= "table" then return tostring(v) end
+  if depth > 2 then return "{...}" end
+  local parts = {}
+  for k, val in pairs(v) do
+    parts[#parts + 1] = tostring(k) .. "=" .. dump(val, depth + 1)
+  end
+  return "{" .. table.concat(parts, ", ") .. "}"
+end
+
 local function describe(r)
   if r.err then return "erro: " .. tostring(r.err) end
   local parts = {}
   for i = 1, math.max(r.n, 1) do
-    local v = r[i]
-    parts[#parts + 1] = (type(v) == "table")
-      and textutils.serialise(v):gsub("%s+", " ")
-      or tostring(v)
+    parts[#parts + 1] = dump(r[i])
   end
   return table.concat(parts, " | ")
 end
@@ -84,19 +95,26 @@ local function countFreeCPUs()
   return free
 end
 
--- Retorna: ok (boolean), detalhe (string)
+-- Retorna: status ("ok" | "?" | "falha"), detalhe (string)
+local function classify(r)
+  if r.err then return "falha" end
+  if r[1] == true then return "ok" end
+  if type(r[1]) == "table" then return "?" end  -- objeto de job: indeterminado
+  return "falha"
+end
+
 local function requestCraft(name, count)
   local r
   if cpuName then
     r = safe(bridge.craftItem, { name = name, count = count }, cpuName)
-    if r[1] ~= true then
+    if classify(r) == "falha" then
       r = safe(bridge.craftItem, { name = name, count = count, cpu = cpuName })
     end
   end
-  if not r or r[1] ~= true then
+  if not r or classify(r) == "falha" then
     r = safe(bridge.craftItem, { name = name, count = count })
   end
-  return r[1] == true, describe(r)
+  return classify(r), describe(r)
 end
 
 -- ---------------------------------------------------------------- boot
@@ -149,18 +167,14 @@ while true do
 
       local count = math.min(e.batch, e.min - have)
       pending[e.name] = t + CONFIG.cooldown
-      local ok, detail = requestCraft(e.name, count)
+      local status, detail = requestCraft(e.name, count)
 
-      if ok then
-        free = free - 1
-        print(string.format("[%s] OK %d x %s (%d/%d)",
-          os.date("%H:%M:%S"), count, e.name, have, e.min))
-      else
-        print(string.format("[%s] FALHA %s -> %s",
-          os.date("%H:%M:%S"), e.name, detail))
-      end
+      if status ~= "falha" then free = free - 1 end
 
-      if CONFIG.debug then
+      print(string.format("[%s] %s %d x %s (%d/%d)",
+        os.date("%H:%M:%S"), status, count, e.name, have, e.min))
+
+      if CONFIG.debug or status == "falha" then
         print("  retorno: " .. detail)
       end
     end
